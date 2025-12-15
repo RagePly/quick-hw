@@ -1,0 +1,7 @@
+# Ignore the trace and signal output
+/signal
+/trace
+
+# Pytyhon...
+
+__pycache__
