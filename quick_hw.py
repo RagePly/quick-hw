@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Callable
 from graphviz import Digraph
 from io import StringIO
 
@@ -27,7 +27,7 @@ class System:
         return self._tracefile.getvalue()
 
     def prepare(self):
-        self.tprint("========== CLEAR CACHE ==========", file=self._tracefile)
+        self.tprint("========== CLEAR CACHE ==========")
         self._values.clear()
     
     def _new(self) -> int:
@@ -84,8 +84,31 @@ class System:
         _kwargs: dict[str, Any] = {"system": self, "system_id": system_id}
         _kwargs.update(kwargs)
         return SHR(input, clk, signal_dffs, **_kwargs)
-
     
+    def mlutn(self, n: int, rules: Callable[[Bits], Bits], *inp: Logic, **kwargs) -> MLUTN:
+        system_id = self._new()
+        _kwargs: dict[str, Any] = {"system": self, "system_id": system_id}
+        _kwargs.update(kwargs)
+        return MLUTN(n, rules, *inp, **_kwargs)
+    
+    def not_(self, inp: Logic, **kwargs) -> Not:
+        system_id = self._new()
+        _kwargs: dict[str, Any] = {"system": self, "system_id": system_id}
+        _kwargs.update(kwargs)
+        return Not(inp, **kwargs)
+    
+    def vector(self, *inp: Logic, **kwargs) -> Vector:
+        system_id = self._new()
+        _kwargs: dict[str, Any] = {"system": self, "system_id": system_id}
+        _kwargs.update(kwargs)
+        return Vector(*inp, **kwargs)
+
+    def mux(self, selector: Logic, *inp: Logic, **kwargs) -> Mux:
+        system_id = self._new()
+        _kwargs: dict[str, Any] = {"system": self, "system_id": system_id}
+        _kwargs.update(kwargs)
+        return Mux(selector, *inp, **kwargs)
+
 
 class Event:
     def __init__(self, name: str, width: int, value: "Bits"):
@@ -274,6 +297,15 @@ class Logic:
             shr = SHR(self, clk, signal_dffs, **kwargs)
         return shr
 
+    def not_(self, **kwargs) -> Not:
+        if self._system is not None:
+            n = self._system.not_(self, **kwargs)
+        else:
+            n = Not(self, **kwargs)
+        return n
+    
+    def count_logic_instances(self) -> int:
+        return 1 + sum(map(Logic.count_logic_instances, self._bw_con))
     
     def signal_event(self, value: "Bits") -> "Bits":
         assert value is not None
@@ -309,7 +341,7 @@ class Logic:
         if self._name is not None:
             return f", name={repr(self._name)}"
         return ""
-
+    
 class Bits(Logic):
     def __init__(self, width: int, value: list[bool] | None = None, **kwargs):
         super().__init__(**kwargs)
@@ -334,6 +366,15 @@ class Bits(Logic):
             "invalid bits"
         return list(self._value)
     
+    def to_int(self) -> int:
+        assert self.is_valid(), \
+            "invalid bits"
+        i = 0
+        for off, b in enumerate(self._value):
+            i |= int(b) << off
+        
+        return i
+    
     def _eval_impl(self):
         return Bits(self._width, list(self._value) if self._value is not None else None)
     
@@ -354,6 +395,51 @@ class Bits(Logic):
     
     def __repr__(self) -> str:
         return f"Bits({repr(self._width)}, {repr(self._value)}{self._name_repr()})"
+
+class Vector(Logic):
+    def __init__(self, *inp: Logic, **kwargs):
+        super().__init__(**kwargs)
+
+        self._inp = inp
+        self._w = sum(i.width() for i in self._inp)
+
+        for i in self._inp:
+            self._register_con(i, self)
+    
+    def width(self):
+        return self._w
+    
+    def _eval_impl(self):
+        return Bits(self.width(), [b for i in self._inp for b in i.eval().as_bitarray()])
+    
+    def __repr__(self) -> str:
+        return f"Vector({', '.join(map(repr, self._inp))}{self._name_repr()})"
+
+class Mux(Logic):
+    def __init__(self, selector: Logic, *inp: Logic, **kwargs):
+        super().__init__(**kwargs)
+
+        self._sel = selector
+        self._inp = inp
+        self._w = inp[0].width()
+
+        assert 2**self._sel.width() == len(self._inp)
+        assert all(i.width() == self._w for i in self._inp)
+
+        self._register_con(selector, self)
+        for i in self._inp:
+            self._register_con(i, self)
+    
+    def width(self):
+        return self._w
+
+    def _eval_impl(self):
+        idx = self._sel.eval().to_int()
+        inps = [i.eval() for i in self._inp]
+        return inps[idx]
+    
+    def __repr__(self) -> str:
+        return f"Mux({repr(self._sel)}, {', '.join(map(repr, self._inp))}{self._name_repr()})"
 
 class Wire(Logic):
     def __init__(self, inp: Logic, index: int, **kwargs):
@@ -440,6 +526,9 @@ class Port(Logic):
     def remove_driver(self):
         self._driver = None
     
+    def has_driver(self) -> bool:
+        return self._driver is not None
+    
     def width(self):
         return self._width
     
@@ -450,6 +539,23 @@ class Port(Logic):
 
     def __repr__(self) -> str:
         return f"Port({self._width}{self._name_repr()})"
+
+class Not(Logic):
+    def __init__(self, inp: Logic, **kwargs):
+        super().__init__(**kwargs)
+        self._inp = inp
+
+        self._register_con(self._inp, self)
+    
+    def width(self):
+        return self._inp.width()
+    
+    def _eval_impl(self):
+        inverted = [(not b) for b in self._inp.eval().as_bitarray()]
+        return Bits(len(inverted), inverted)
+    
+    def __repr__(self) -> str:
+        return f"Not({repr(self._inp)}{self._name_repr()})"
 
 class Comb(Logic):
     OPERATORS = ["XNOR", "AND", "OR", "XOR", "NAND", "NOR"]
@@ -491,6 +597,11 @@ class Comb(Logic):
                     if not b:
                         return Bits(1, [False])
                 return Bits(1, [True])
+            case "OR":
+                for b in bits:
+                    if b:
+                        return Bits(1, [True])
+                return Bits(1, [False])
             case _:
                 raise RuntimeError(f"unimplemented type {self._var}")
         assert False
@@ -546,6 +657,37 @@ class DFlipFlop(Logic):
     
     def __repr__(self) -> str:
         return f"DFlipFlop({repr(self._input)}, {repr(self._clk)}{self._name_repr()})"
+
+class MLUTN(Logic):
+    def __init__(self, n: int, rules: Callable[[Bits], Bits], *inp: Logic, **kwargs):
+        super().__init__(**kwargs)
+        self._m = len(inp)
+        self._inp = inp
+        self._n = n
+
+        for i in inp:
+            self._register_con(i, self)
+
+        self._table: dict[tuple[bool, ...], Bits] = {
+            pat: rules(Bits(len(pat), list(pat)))
+            for pat in (
+                tuple(bool((idx >> i) & 1) for i in range(8))
+                for idx in range(2**self._m)
+            )
+        }
+
+        assert all(len(b._value) == self._n for b in self._table.values())
+
+    def _eval_impl(self):
+        inp = Bits(self._m, [i.eval().as_bitarray()[0] for i in self._inp])
+        return self._table[tuple(inp.as_bitarray())]
+    
+    def width(self):
+        return self._n
+    
+    def __repr__(self) -> str:
+        return f"MLUTN({self._m}, {self._n}, {repr(self._inp)}, <ruleset>{self._name_repr()})"
+
             
 class Component:
     def __init__(self, outputs: list[Logic], inputs: list[Logic]):

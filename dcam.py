@@ -1,7 +1,9 @@
+from typing import cast
 from quick_hw import *
 from pathlib import Path
 from datetime import datetime
 from autoindent import autoindent
+from math import log2, ceil
 
 GLOBAL_SIGNAL = Signal()
 GLOBAL_SYSTEM = System()
@@ -70,6 +72,45 @@ def connect_decoder_matchers(matchers: map[str, Component], decoders: map[str, C
     for matcher in matchers.values():
         connect_parser_matcher(decoder_output, matcher)
 
+def generate_priority(patterns: list[str], tot_inp: int) -> dict[str, int]:
+    return {p: tot_inp - 1 - i for i, p in enumerate(patterns)}
+
+def generate_pe(patterns: list[str]) -> Component:
+    required = 4**ceil(log2(len(patterns)) / 2)
+    print(f"Generating Priority encoder with {required}-inputs")
+    pe =  pe_n(required, f"PE")
+    idx, vid = pe.get_outputs()
+    idx.register_signal(GLOBAL_SIGNAL)
+    vid.register_signal(GLOBAL_SIGNAL)
+
+    return pe
+
+
+def connect_matchers_pe(patterns: list[str], matchers: dict[str,Component], pe: Component):
+    priority = generate_priority(patterns, len(pe.get_inputs()))
+    missing = len(pe.get_inputs()) - len(matchers)
+
+    assert len(priority) + missing == len(pe.get_inputs())
+
+    pe_inputs = pe.get_inputs()
+
+    set_i = set()
+    for i in range(missing):
+        set_i.add(i)
+
+        pe_inputs_i = pe_inputs[i]
+        assert isinstance(pe_inputs_i, Port)
+        pe_inputs_i.set_driver(Bits(1, [False]))
+    
+    for p, i in priority.items():
+        assert i not in set_i, f"Set up {i} multiple times: {priority}"
+        pe_inputs_i = pe_inputs[i]
+        assert isinstance(pe_inputs_i, Port)
+        _, logic = matchers[p].find_logic("out")
+        pe_inputs_i.set_driver(logic)
+    
+    assert all(cast(Port, i).has_driver() for i in pe.get_inputs())
+
 def connect_to_clock(clk: Logic, logic: list[Component]):
     for log in logic:
         _, clk_log = log.find_logic("clk")
@@ -80,7 +121,9 @@ def connect_to_clock(clk: Logic, logic: list[Component]):
 class DecoderParser:
     def __init__(self, patterns: list[str]):
         self._matchers, self._decoders = generate_parsers(patterns)
+        self._pe = generate_pe(patterns)
         connect_decoder_matchers(self._matchers, self._decoders)
+        connect_matchers_pe(patterns, self._matchers, self._pe)
     
     def add_clk(self, clk: Logic):
         connect_to_clock(clk, list(self._decoders.values()))
@@ -94,16 +137,17 @@ class DecoderParser:
             inp.set_driver(input_bits)
     
     def eval_output(self) -> dict[str, bool]:
-        output = {}
-        for pat, mat in self._matchers.items():
-            mat.eval_all()
-            _, output[pat] = mat.find_logic("out")
-        return output
-    
+        idx, vid = self._pe.get_outputs()
+
+        is_valid = vid.eval()
+        idx_bits = idx.eval()
+
+        return is_valid.as_bitarray()[0], idx_bits.to_int()
+        
     def simulate_step(self):
         self.eval_output()     
     
-    def simulate(self, steps: int, input_str: str):
+    def simulate(self, steps: int, input_str: str) -> list[int]:
         s = GLOBAL_SYSTEM
         clk = s.port(1, name="clk")
         input_port = s.port(8, name="input")
@@ -113,6 +157,8 @@ class DecoderParser:
 
         self.add_clk(clk)
         self.set_input(input_port)
+
+        patterns = []
 
         for i in range(steps):
             print(f"Simulating {i+1:3}/{steps:3}")
@@ -142,25 +188,105 @@ class DecoderParser:
 
             # clk high simulation
             GLOBAL_SYSTEM.prepare()
-            self.eval_output()
+            valid, pattern_id = self.eval_output()
             GLOBAL_SYSTEM.commit()
 
             GLOBAL_SIGNAL.step_time_ps(1)
 
-def priority_id_encoder(count: int) -> Component:
-    # TODO: ... 
-    # Just look up how they work
-    # It seems hard to figure out a match_x to id (int) type thing
-    # Or that could be handled by HLS...  yeah, let HLS figure out that!
-    ...
+            if valid:
+                patterns.append(pattern_id)
+
+        return patterns
+
+def pe4(name: str | None = None) -> Component:
+    s = GLOBAL_SYSTEM
+    i0, i1, i2, i3 = [s.port(1) for _ in range(4)]
+
+    o0 = s.comb("OR", i3, s.comb("AND", i2.not_(), i1))
+    t = s.comb("OR", i3, i2)
+
+    o1 = s.port(1)
+    o1.set_driver(t)
+    vid = s.comb("OR", t, i1, i0, name=f"{name}:PE_{4}:vid" if name is not None else None)
+
+    idx = s.vector(o0, o1, name=f"{name}:PE_{4}:idx" if name is not None else None)
+
+    return Component([idx, vid], [i0, i1, i2, i3])
+
+def pe_n(n: int, name: str | None = None) -> Component:
+    assert n >= 4
+    if n == 4:
+        return pe4(name)
+    assert n % 4 == 0
+
+    s = GLOBAL_SYSTEM
+    nk = n // 4
+
+    root = f"{name}:PE_{n}" if name is not None else f"PE_{n}"
+    inp = []
+    sub_idx = []
+    vs = []
+    for i in range(4):
+        sub_pe = pe_n(nk, f"{root}:{i}") 
+        inp.extend(sub_pe.get_inputs())
+        sub_pe_idx, sub_v = sub_pe.get_outputs()
+        sub_idx.append(sub_pe_idx)
+        vs.append(sub_v)
     
+    sel = pe4(None)
+    for sel_i, v_out in zip(sel.get_inputs(), vs):
+        assert isinstance(sel_i, Port)
+        sel_i.set_driver(v_out)
+
+    sel_idx, vid = sel.get_outputs()
+    vid.set_name(f"{root}:vid")
+    sel_idx.set_name(f"{root}:idx_upper")
+
+    mux = s.mux(sel_idx, *sub_idx)
+    idx = s.vector(mux, sel_idx, name=f"{root}:idx")
+    
+    return Component([idx, vid], inp)
+
 if __name__ == "__main__":
-    patterns = open(".\\inputs\\overlap.txt").read().splitlines()
+
+    # print("Generating PE component")
+
+    # pe = pe_n(4**6) 
+
+    # print("Approximate number of Components:", sum(map(Logic.count_logic_instances, pe.get_outputs())))
+
+    # print("Generating graph")
+    # graph = Digraph("PE4", engine="sfdp")
+    
+    # idx, vid = pe.get_outputs()
+    # for i, inp in enumerate(pe.get_inputs()):
+    #     inp.set_name(f"in:{i}")
+
+    # idx.graph_bw(graph)
+    # vid.graph_bw(graph)
+
+    # graph.render()
+
+    patterns = open(".\\inputs\\MINI_pattern_match_snort3_content.txt").read().splitlines()
 
     # s = GLOBAL_SYSTEM
     decode_parser = DecoderParser(patterns)
 
-    decode_parser.simulate(12, "abc")
+    # print("Generating graph")
+    # graph = Digraph("dcam")
+    # for out in decode_parser._pe.get_outputs():
+    #     out.graph_bw(graph)
+    # graph.render()
+
+    # GLOBAL_SYSTEM.enable_trace()
+
+    pattern_ids = decode_parser.simulate(32, "/environ.pl .pl")
+
+    print("Saw patterns: ")
+    for pid in pattern_ids:
+        row = len(patterns) - pid
+        index = row - 1
+        print(f"{row:4}: {patterns[index]}")
 
     trace_root = Path(".\\trace")
     trace_root.mkdir(exist_ok=True)
@@ -181,13 +307,3 @@ if __name__ == "__main__":
     with open(signal_root / signal_file, "w", encoding="utf-8") as fp:
         fp.write(GLOBAL_SIGNAL.dump_vcd())
 
-    # input_bits = Bits(8, name="input")
-    # input_clk = Bits(1, name="clk")
-    # decode_parser = DecoderParser(patterns)
-    # decode_parser.add_clk(input_clk)
-    # decode_parser.set_input(input_bits)
-    # graph = Digraph("dcam")
-    # for parser in decode_parser._matchers.values():
-    #     for out in parser.get_outputs():
-    #         out.graph_bw(graph)
-    # graph.render()
