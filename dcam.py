@@ -1,20 +1,23 @@
-from typing import cast
+from typing import cast, Sequence
 from quick_hw import *
 from pathlib import Path
 from datetime import datetime
 from autoindent import autoindent
 from math import log2, ceil
+import vhdl_renderer
 
 GLOBAL_SIGNAL = Signal()
 GLOBAL_SYSTEM = System()
 
-def parse_char(c: str) -> Component:
+def parse_char(c: str, prefix: str | None = None) -> Component:
     assert len(c) == 1
     assert c.isascii()
 
+    namespace = "" if prefix is None else f"{prefix}:"
+
     s = GLOBAL_SYSTEM
 
-    name = f"match_{hex(ord(c))}"
+    name = f"{namespace}match_{hex(ord(c))}"
 
     clk = s.port(1, name=f"{name}:clk")
     c_bits = Bits.from_ascii(c)
@@ -24,20 +27,21 @@ def parse_char(c: str) -> Component:
 
     return Component([comp], [clk, inp])
 
-def solve_match(sid: int, pattern: str) -> Component:
+def solve_match(sid: int, pattern: str, prefix: str | None = None) -> Component:
+    namespace = "" if prefix is None else f"{prefix}:"
     s = GLOBAL_SYSTEM
     char_ports = [
-        s.port(1, name=f"match_p_{sid}_{len(pattern) - 1 - i}:match_{hex(ord(c))}")
+        s.port(1, name=f"{namespace}match_p_{sid}_{len(pattern) - 1 - i}:match_{hex(ord(c))}")
         for i, c in enumerate(pattern)
     ]
-    clk = s.port(1, name=f"match_p_{sid}:clk")
+    clk = s.port(1, name=f"{namespace}match_p_{sid}:clk")
 
-    target = s.comb("AND", *char_ports, name=f"match_p_{sid}:out").dflipflop(clk, True)
+    target = s.comb("AND", *char_ports, name=f"{namespace}match_p_{sid}:out").dflipflop(clk, True)
     target.register_signal(GLOBAL_SIGNAL)
 
     return Component([target], [clk, *char_ports])
 
-def connect_parser_matcher(parsers: map[str, Logic], match_logic: Component):
+def connect_parser_matcher(parsers: dict[str, Logic], match_logic: Component):
     for inp in match_logic.get_inputs():
         if not isinstance(inp, Port):
             continue
@@ -55,19 +59,61 @@ def connect_parser_matcher(parsers: map[str, Logic], match_logic: Component):
                 f"decoder {output_name} has no output-shiftreg"
             inp.set_driver(parser_output.index(index_of))
 
-def generate_decoders_from_patterns(patterns: list[str]) -> map[str, Component]:
+def generate_decoders_from_patterns(patterns: list[str], prefix: str | None = None) -> dict[str, Component]:
     chars = set(c for pat in patterns for c in pat)
-    return {c: parse_char(c) for c in chars}
+    return {c: parse_char(c, prefix) for c in chars}
 
-def generate_matchers_from_patterns(patterns: list[str]) -> map[str, Component]:
-    return {pat: solve_match(i, pat) for i, pat in enumerate(patterns)}
+def generate_parallel_decoders(degree: int, patterns: list[str]) -> dict[tuple[int, str], Component]:
+    return {(i, c): dec for i in range(degree) for c, dec in generate_decoders_from_patterns(patterns, f"offset{i}").items()}
+
+def generate_matchers_from_patterns(patterns: list[str], prefix: str | None = None) -> dict[str, Component]:
+    return {pat: solve_match(i, pat, prefix) for i, pat in enumerate(patterns)}
+
+def generate_parallel_matchers(degree: int, patterns: list[str]) -> dict[tuple[int, str], Component]:
+    return {(i, pat): comp for i in range(degree) for pat, comp in generate_matchers_from_patterns(patterns, f"offset{i}").items()}
+
+def connect_decoder_matcher_parallel(degree: int, decoders: dict[str, Logic], match_logic: Component):
+    for inp in match_logic.get_inputs():
+        if not isinstance(inp, Port):
+            continue
+            
+        name = inp.get_name()
+        offset, match_name, decoder_source = name.split(":")
+
+        match_offset = int(offset.removeprefix("offset"))
+
+        if decoder_source.startswith("match_"):
+            pattern_offset = int(match_name.split("_")[-1]) # TODO: this encoding of index is REALLY shitty, and it's getting worse!
+
+            global_offset = match_offset + pattern_offset 
+            shr_index = global_offset // degree
+
+            intra_packet_index = degree - 1 - (global_offset % degree) # reversed, since every packet is in order
+
+            output_name = f"offset{intra_packet_index}:{decoder_source}:out"
+            assert output_name in decoders, \
+                f"missing parser for {output_name}"
+            parser_output = decoders[output_name]
+            assert isinstance(parser_output, SHR), \
+                f"decoder {output_name} has no output-shiftreg"
+            inp.set_driver(parser_output.index(shr_index))
+
+def connect_decoder_matchers_parallel(degree: int, decoders: dict[tuple[int, str], Component], matchers: dict[tuple[int, str], Component]):
+    decoder_output = dict(comp.find_logic("out") for comp in decoders.values())
+    for matcher in matchers.values():
+        connect_decoder_matcher_parallel(degree, decoder_output, matcher)
 
 def generate_parsers(patterns: list[str]) -> tuple[dict[str, Component], dict[str, Component]]:
     decoders = generate_decoders_from_patterns(patterns)
     matchers = generate_matchers_from_patterns(patterns)
     return matchers, decoders
 
-def connect_decoder_matchers(matchers: map[str, Component], decoders: map[str, Component]):
+def generate_parsers_parallel(degree: int, patterns: list[str]) -> tuple[dict[tuple[int, str], Component], dict[tuple[int, str], Component]]:
+    decoders = generate_parallel_decoders(degree, patterns)
+    matchers = generate_parallel_matchers(degree, patterns)
+    return matchers, decoders
+
+def connect_decoder_matchers(matchers: dict[str, Component], decoders: dict[str, Component]):
     decoder_output = dict(comp.find_logic("out") for comp in decoders.values())
     for matcher in matchers.values():
         connect_parser_matcher(decoder_output, matcher)
@@ -75,10 +121,11 @@ def connect_decoder_matchers(matchers: map[str, Component], decoders: map[str, C
 def generate_priority(patterns: list[str], tot_inp: int) -> dict[str, int]:
     return {p: tot_inp - 1 - i for i, p in enumerate(patterns)}
 
-def generate_pe(patterns: list[str]) -> Component:
+def generate_pe(patterns: list[str], prefix: str | None = None) -> Component:
+    namespace = "" if prefix is None else f"{prefix}:"
     required = 4**ceil(log2(len(patterns)) / 2)
     print(f"Generating Priority encoder with {required}-inputs")
-    pe =  pe_n(required, f"PE")
+    pe =  pe_n(required, f"{namespace}PE")
     idx, vid = pe.get_outputs()
     idx.register_signal(GLOBAL_SIGNAL)
     vid.register_signal(GLOBAL_SIGNAL)
@@ -118,6 +165,98 @@ def connect_to_clock(clk: Logic, logic: list[Component]):
             "expected clk connection to be a Port"
         clk_log.set_driver(clk)
 
+class DecoderParserParallel:
+    def __init__(self, degree: int, patterns: list[str]):
+        self._degree = degree
+        self._matchers , self._decoders = generate_parsers_parallel(degree, patterns)
+        self._pes = [generate_pe(patterns, f"offset{i}") for i in range(degree)]
+        connect_decoder_matchers_parallel(degree, self._decoders, self._matchers)
+
+        for i, pe in enumerate(self._pes):
+            valid_matchers = {pat: comp for (offset, pat), comp in self._matchers.items() if offset == i}
+            connect_matchers_pe(patterns, valid_matchers, pe)
+
+    def add_clk(self, clk: Logic):
+        connect_to_clock(clk, list(self._decoders.values()))
+        connect_to_clock(clk, list(self._matchers.values()))
+    
+    def set_input(self, input_bits: Sequence[Logic]):
+        for (dec_offset, _), dec in self._decoders.items():
+            inp = input_bits[dec_offset]
+            _, input_port = dec.find_logic("input")
+            assert isinstance(input_port, Port)
+            input_port.set_driver(inp)
+    def eval_output(self) -> list[tuple[bool, int]]:
+        matches = []
+        for pe in self._pes:
+            idx, vid = pe.get_outputs()
+
+            is_valid = vid.eval()
+            idx_bits = idx.eval()
+
+            matches.append((is_valid.as_bitarray()[0], idx_bits.to_int()))
+        return matches
+    
+    def simulate_step(self):
+        self.eval_output()     
+
+    def simulate(self, steps: int, input_str: bytes) -> list[list[int]]:
+        s = GLOBAL_SYSTEM
+        clk = s.port(1, name="clk")
+        input_ports = [s.port(8, name=f"input{i}") for i in range(self._degree)]
+
+        clk.register_signal(GLOBAL_SIGNAL)
+        for input_port in input_ports:
+            input_port.register_signal(GLOBAL_SIGNAL)
+
+        self.add_clk(clk)
+        self.set_input(input_ports)
+
+        valid_patterns: list[list[int]] = []
+
+        for i in range(steps):
+            print(f"Simulating {i+1:3}/{steps:3}")
+
+
+            for j in range(self._degree):
+                input_index = i * self._degree + j
+
+                if input_index < len(input_str):
+                    input_ports[j].set_driver(Bits.from_int(input_str[input_index]))
+                else:
+                    input_ports[j].set_driver(Bits(8, [False for _ in range(8)]))
+
+            # falling edge simulation
+            clk.set_driver(Bits(1, [False]))
+            GLOBAL_SYSTEM.prepare()
+            self.eval_output()
+            GLOBAL_SYSTEM.commit()
+
+            # Clk low simulation
+            GLOBAL_SYSTEM.prepare()
+            self.eval_output()
+            GLOBAL_SYSTEM.commit()
+
+            GLOBAL_SIGNAL.step_time_ps(1)
+
+            # rising edge simulation 
+            clk.set_driver(Bits(1, [True]))
+            GLOBAL_SYSTEM.prepare()
+            self.eval_output()
+            GLOBAL_SYSTEM.commit()
+
+            # clk high simulation
+            GLOBAL_SYSTEM.prepare()
+            valids = [(v, idx) for v, idx in self.eval_output() if v]
+            GLOBAL_SYSTEM.commit()
+
+            GLOBAL_SIGNAL.step_time_ps(1)
+
+            if valids:
+                valid_patterns.append([idx for _, idx in valids])
+
+        return valid_patterns
+
 class DecoderParser:
     def __init__(self, patterns: list[str]):
         self._matchers, self._decoders = generate_parsers(patterns)
@@ -125,6 +264,7 @@ class DecoderParser:
         connect_decoder_matchers(self._matchers, self._decoders)
         connect_matchers_pe(patterns, self._matchers, self._pe)
     
+
     def add_clk(self, clk: Logic):
         connect_to_clock(clk, list(self._decoders.values()))
         connect_to_clock(clk, list(self._matchers.values()))
@@ -136,7 +276,7 @@ class DecoderParser:
                 "expected input to be a Port"
             inp.set_driver(input_bits)
     
-    def eval_output(self) -> dict[str, bool]:
+    def eval_output(self) -> tuple[bool, int]:
         idx, vid = self._pe.get_outputs()
 
         is_valid = vid.eval()
@@ -214,7 +354,7 @@ def pe4(name: str | None = None) -> Component:
     return Component([idx, vid], [i0, i1, i2, i3])
 
 def pe_n(n: int, name: str | None = None) -> Component:
-    assert n >= 4
+    assert n >= 4, n
     if n == 4:
         return pe4(name)
     assert n % 4 == 0
@@ -290,8 +430,7 @@ def gen_random(length: int, patterns_in: list[str]) -> tuple[bytes, list[int]]:
     
     return bytes(stream), order
 
-if __name__ == "__main__":
-
+def main_single():
     # print("Generating PE component")
 
     # pe = pe_n(4**6) 
@@ -352,6 +491,48 @@ if __name__ == "__main__":
     signal_root.mkdir(exist_ok=True)
 
     d = datetime.today()
+    date_portion = d.strftime("%y%m%d")
+    time_portion = d.hour * 3600 + d.minute * 60 + d.second
+
+    if GLOBAL_SYSTEM.has_trace():
+        trace_file = f"{date_portion}_{time_portion}.trace"
+        with open(trace_root / trace_file, "w", encoding="utf-8") as fp:
+            fp.write(autoindent(GLOBAL_SYSTEM.get_trace()))
+
+    signal_file = f"{date_portion}_{time_portion}.vcd" 
+    with open(signal_root / signal_file, "w", encoding="utf-8") as fp:
+        fp.write(GLOBAL_SIGNAL.dump_vcd())
+
+def main_parallel(degree: int):
+    patterns = open(".\\inputs\\MINI_pattern_match_snort3_content.txt").read().splitlines()
+    parsers = DecoderParserParallel(degree, patterns)
+
+    render = vhdl_renderer.VHDLRenderer("krnl_proj")
+    for pe in parsers._pes:
+        for out in pe.get_outputs():
+            render.feed_output(out.get_name().replace(":", "_"), out)
+    
+    render.process()
+    outdir = Path("bin")
+    outdir.mkdir(exist_ok=True)
+    with open(outdir / "krnl_proj.vhd", "w") as fp:
+        fp.write(render.render())
+    # print("Generating graph")
+    # graph = Digraph("dcam")
+    # for m in parsers._matchers.values():
+    #     for out in m.get_outputs():
+    #         out.graph_bw(graph)
+    # graph.render()
+
+    print(parsers.simulate(24, b"abcdefghijklmnop"))
+
+    trace_root = Path(".\\trace")
+    trace_root.mkdir(exist_ok=True)
+
+    signal_root = Path(".\\signal")
+    signal_root.mkdir(exist_ok=True)
+
+    d = datetime.today()
     date_portion = d.strftime("%Y%m%d")
     time_portion = d.hour * 3600 + d.minute * 60 + d.second
 
@@ -364,3 +545,74 @@ if __name__ == "__main__":
     with open(signal_root / signal_file, "w", encoding="utf-8") as fp:
         fp.write(GLOBAL_SIGNAL.dump_vcd())
 
+def vhdl_parallel(degree: int, source: Path | str):
+    patterns = open(source).read().splitlines()
+    s = GLOBAL_SYSTEM
+    
+    clk = s.port(1, name="clk")
+    inputs = [s.port(8, name=f"input_{i}") for i in range(degree)]
+    parsers = DecoderParserParallel(degree, patterns)
+
+    parsers.add_clk(clk)
+    parsers.set_input(inputs)
+
+    dofile = StringIO()
+    dofile_outputs = []
+    render = vhdl_renderer.VHDLRenderer("krnl_proj")
+    for pe in parsers._pes:
+        for out in pe.get_outputs():
+            name = out.get_name().replace(":", "_")
+            render.feed_output(name, out)
+            dofile_outputs.append(name)
+    
+    dofile_inputs = [f"r_input_{i}" for i in range(degree)] 
+
+    print("restart -f -nowave", file=dofile)
+    print("add wave -position insertpoint \\", file=dofile)
+    print("sim:/krnl_proj/clk \\", file=dofile)
+    print(" \\\n".join(f"sim:/krnl_proj/{n}" for n in [*dofile_inputs, *dofile_outputs]), file=dofile)
+    print("", file=dofile)    
+    print("force clk 0 0, 1 10ns -repeat 20ns", file=dofile)
+
+    msg = "Hello...@@@"
+
+    for i in range(16):
+        print("", file=dofile)
+        for j in range(4):
+            jj = i*degree + j
+            if jj < len(msg):
+                c = msg[jj]
+            else:
+                c = '\0'
+            
+            print(f"force r_input_{j} 10#{ord(c)}", file=dofile)
+        print("run 20ns", file=dofile)
+
+    render.process()
+    outdir = Path("bin")
+    outdir.mkdir(exist_ok=True)
+    with open(outdir / "krnl_proj.vhd", "w") as fp:
+        fp.write(render.render())
+
+    with open(outdir / "krnl_proj.do", "w") as fp:
+        fp.write(dofile.getvalue())
+
+def simple_vhdl():
+    s = GLOBAL_SYSTEM
+
+
+    clk = s.port(1, name="clk")
+    expr1 = s.comb("AND", Bits(1, [True]), Bits(1, [False]))
+    expr1_reg = expr1.dflipflop(clk, name="expr1")
+
+    expr2 = s.comb("OR", expr1_reg, Bits(1, [True]))
+
+    renderer = vhdl_renderer.VHDLRenderer("test_design")
+    renderer.feed_assignment("expr2", expr2)
+
+    renderer.process()    
+
+    print(renderer.render())
+
+if __name__ == "__main__":
+    vhdl_parallel(4, ".\\inputs\\MINI_pattern_match_snort3_content.txt")

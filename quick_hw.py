@@ -214,7 +214,7 @@ def connect_edge(fr: Logic, to: Logic, graph: Digraph):
         graph.edge(fr_s, to_s)
 
 class Logic:
-    def __init__(self, /, name: str = None, system: System = None, system_id: int = None):
+    def __init__(self, /, name: str | None = None, system: System | None = None, system_id: int | None = None):
         self._name = name
         self._fw_con: list[Logic] = []
         self._bw_con: list[Logic] = []
@@ -246,6 +246,7 @@ class Logic:
         to._register_bw(fr)
 
     def get_name(self) -> str:
+        assert self._name is not None
         return self._name
 
     def set_name(self, name: str):
@@ -271,7 +272,7 @@ class Logic:
     def width(self) -> int:
         raise RuntimeError(f"width not implemented for {self.__class__}")
     
-    def dflipflop(self, clk: "Logic", inherit_name: bool = False, **kwargs) -> "Logic":
+    def dflipflop(self, clk: "Logic", inherit_name: bool = False, **kwargs) -> DFlipFlop:
         if inherit_name:
             assert "name" not in kwargs, \
                 "cannot inherit name if an explicit name is requested"
@@ -304,14 +305,24 @@ class Logic:
             n = Not(self, **kwargs)
         return n
     
-    def count_logic_instances(self) -> int:
-        return 1 + sum(map(Logic.count_logic_instances, self._bw_con))
+    def count_logic_instances(self, visited: set[int] | None = None) -> int:
+        self_id = id(self)
+        if visited is None:
+            visited = set()
+            visited.add(self_id)
+            this = 1
+        elif self_id not in visited:
+            visited.add(self_id)
+            this =  1
+        else:
+            this = 0
+        return this + sum(sublog.count_logic_instances(visited) for sublog in self._bw_con)
     
     def signal_event(self, value: "Bits") -> "Bits":
         assert value is not None
         if self._signal is None:
             return value
-        self._signal.register_signal(self._name, value) 
+        self._signal.register_signal(self.get_name(), value) 
         return value
     
     def tprint(self, *args, **kwargs):
@@ -320,12 +331,12 @@ class Logic:
     
     def eval(self) -> Bits:
         self.tprint(f"BEGIN EVAL {self.__class__}: {self._name}")
-        if self._system is not None and (res := self._system.get_cached(self._system_id)) is not None:
+        if self._system is not None and self._system_id is not None and (res := self._system.get_cached(self._system_id)) is not None:
             self.tprint(f"END EVAL {self.__class__}: {self._name} CACHE {res}")
             return res
         b = self.signal_event(self._eval_impl())
         self.tprint(f"END EVAL {self.__class__}: {self._name} = {b}")
-        if self._system is not None:
+        if self._system is not None and self._system_id is not None:
             self._system.update_cache(self._system_id, b)
         return b
     
@@ -358,22 +369,29 @@ class Bits(Logic):
         if self._value is not None:
             graph.node(self.node_name(), "".join(str(int(b)) for b in self._value), shape="parallelogram")
         return super().graph_bw(graph, fr)
+
     def is_valid(self) -> bool:
         return self._value is not None
 
     def as_bitarray(self) -> list[bool]:
-        assert self.is_valid(), \
+        assert self._value is not None, \
             "invalid bits"
         return list(self._value)
     
     def to_int(self) -> int:
-        assert self.is_valid(), \
+        assert self._value is not None, \
             "invalid bits"
         i = 0
         for off, b in enumerate(self._value):
             i |= int(b) << off
         
         return i
+    def count_logic_instances(self, visited: set[int] | None = None) -> int:
+        if visited is None:
+            visited = set()
+        visited.add(id(self))
+        return super().count_logic_instances(visited)
+
     
     @staticmethod
     def from_int(n: int) -> Bits:
@@ -411,6 +429,12 @@ class Vector(Logic):
         for i in self._inp:
             self._register_con(i, self)
     
+    def count_logic_instances(self, visited: set[int] | None = None) -> int:
+        if visited is None:
+            visited = set()
+        visited.add(id(self))
+        return super().count_logic_instances(visited)
+
     def width(self):
         return self._w
     
@@ -434,6 +458,7 @@ class Mux(Logic):
         self._register_con(selector, self)
         for i in self._inp:
             self._register_con(i, self)
+
     
     def width(self):
         return self._w
@@ -455,6 +480,12 @@ class Wire(Logic):
 
         self._register_con(inp, self)
     
+    def count_logic_instances(self, visited: set[int] | None = None) -> int:
+        if visited is None:
+            visited = set()
+        visited.add(id(self))
+        return super().count_logic_instances(visited)
+
     def node_name(self):
         return super().node_name() + f"({self._index})"
     
@@ -525,6 +556,12 @@ class Port(Logic):
         else:
             graph.node(self.node_name())
 
+    def count_logic_instances(self, visited: set[int] | None = None) -> int:
+        if visited is None:
+            visited = set()
+        visited.add(id(self))
+        return super().count_logic_instances(visited)
+
     def set_driver(self, driver: Logic):
         self._driver = driver
     
@@ -579,8 +616,24 @@ class Comb(Logic):
     
     def node_name(self):
         return super().node_name() + f"({self._var})"
+    
     def width(self):
         return 1
+    
+    def count_logic_instances(self, visited: set[int] | None = None) -> int:
+        import math
+        self_id = id(self)
+        approx = sum(8**i for i in range(math.ceil(math.log2(len(self._inputs)) / 3)))
+        if visited is None:
+            visited = set()
+            visited.add(self_id)
+            this = approx
+        elif self_id not in visited:
+            visited.add(self_id)
+            this =  approx
+        else:
+            this = 0
+        return this + sum(sublog.count_logic_instances(visited) for sublog in self._bw_con)
     
     def _eval_impl(self):
         inputs = [l.eval() for l in self._inputs]
@@ -633,6 +686,12 @@ class DFlipFlop(Logic):
         Logic._register_con(input, self)
         Logic._register_con(clk, self)
     
+    def count_logic_instances(self, visited: set[int] | None = None) -> int:
+        if visited is None:
+            visited = set()
+        visited.add(id(self))
+        return super().count_logic_instances(visited)
+
     def graph_bw(self, graph, fr = None):
         graph.node(self.node_name(), shape="box")
         return super().graph_bw(graph, fr)
@@ -681,7 +740,7 @@ class MLUTN(Logic):
             )
         }
 
-        assert all(len(b._value) == self._n for b in self._table.values())
+        assert all(b._value is not None and len(b._value) == self._n for b in self._table.values())
 
     def _eval_impl(self):
         inp = Bits(self._m, [i.eval().as_bitarray()[0] for i in self._inp])
