@@ -375,6 +375,11 @@ class Bits(Logic):
         
         return i
     
+    @staticmethod
+    def from_int(n: int) -> Bits:
+        bits = Bits(8, [bool(1 & (n >> i)) for i in range(8)])
+        return bits
+    
     def _eval_impl(self):
         return Bits(self._width, list(self._value) if self._value is not None else None)
     

@@ -147,7 +147,7 @@ class DecoderParser:
     def simulate_step(self):
         self.eval_output()     
     
-    def simulate(self, steps: int, input_str: str) -> list[int]:
+    def simulate(self, steps: int, input_str: bytes) -> list[int]:
         s = GLOBAL_SYSTEM
         clk = s.port(1, name="clk")
         input_port = s.port(8, name="input")
@@ -163,7 +163,7 @@ class DecoderParser:
         for i in range(steps):
             print(f"Simulating {i+1:3}/{steps:3}")
             if i < len(input_str):
-                input_port.set_driver(Bits.from_ascii(input_str[i]))
+                input_port.set_driver(Bits.from_int(input_str[i]))
             else:
                 input_port.set_driver(Bits(8, [False for _ in range(8)]))
 
@@ -247,6 +247,49 @@ def pe_n(n: int, name: str | None = None) -> Component:
     
     return Component([idx, vid], inp)
 
+def gen_random(length: int, patterns_in: list[str]) -> tuple[bytes, list[int]]:
+    import random
+    length = int(length)
+    random.seed(0)
+    patterns: list[bytes] = []
+
+    for line in patterns_in:
+        patterns.append(line.encode("ascii"))
+    
+    stream: bytearray = bytearray()
+
+    while len(stream) < length:
+        if random.random() < 0.2:
+            seq_len = random.randint(8, 64)
+            random_bytes = random.randbytes(seq_len)
+            stream += random_bytes 
+        else:
+            pattern_id = random.randint(1, len(patterns))
+            pattern = patterns[pattern_id-1]
+            stream += pattern
+        
+    # truncate
+    stream = stream[:length]
+
+    # patch with 0s
+    pkt_size = 512 // 8
+    rem = len(stream) % pkt_size
+    if rem > 0:
+        stream += bytes(0 for _ in range(pkt_size - rem))
+    
+    # Run brute force version of the algorithm
+    order = []
+    window = bytes()
+    for b in stream:
+        window = bytes([b]) + window
+        # This simulates our approach
+        for i, pattern in enumerate(patterns):
+            if window.startswith(bytes(reversed(pattern))):
+                order.append(i)
+                break
+    
+    return bytes(stream), order
+
 if __name__ == "__main__":
 
     # print("Generating PE component")
@@ -280,13 +323,27 @@ if __name__ == "__main__":
 
     # GLOBAL_SYSTEM.enable_trace()
 
-    pattern_ids = decode_parser.simulate(32, "/environ.pl .pl")
+    pattern_stream, id_order = gen_random(1024, patterns)    
+    open("temp.txt", "w").write(repr(pattern_stream))
+    exit(0)
+    print(pattern_stream)
+    print("Saving expected order in order.txt")
+    with open("order.txt", "w") as order_txt:
+        for pid in id_order:
+            row = pid + 1
+            print(f"{row:4}: {patterns[pid]}", file=order_txt)
+    exit(0)
+    pattern_ids = decode_parser.simulate(1032, pattern_stream)
 
-    print("Saw patterns: ")
-    for pid in pattern_ids:
-        row = len(patterns) - pid
-        index = row - 1
-        print(f"{row:4}: {patterns[index]}")
+    if len(pattern_ids) != len(id_order):
+        print("ERROR: mismatch between the two orders")
+
+    print("Saving seen order in actual.txt")
+    with open("actual.txt", "w") as actual_txt:
+        for pid in pattern_ids:
+            row = len(patterns) - pid
+            index = row - 1
+            print(f"{row:4}: {patterns[index]}", file=actual_txt)
 
     trace_root = Path(".\\trace")
     trace_root.mkdir(exist_ok=True)
