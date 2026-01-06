@@ -313,7 +313,7 @@ class VHDLRenderer:
                 return self._render_expr(port._driver)
             case Wire() as wire:
                 inp = wire._inp
-                inp_name = self._get_name(inp)
+                inp_name = self._get_name(inp) + "_wire"
                 self._work_stack.append(Assignment(inp_name, wire._inp));
                 return f"{inp_name}({wire._index})"
             case Vector() as vector:

@@ -1,6 +1,10 @@
-from typing import Any, Callable
+from typing import Any, Callable, cast
+from collections.abc import Iterator
+from functools import singledispatchmethod
 from graphviz import Digraph
 from io import StringIO
+from quick_util import warn_once
+from re import Pattern
 
 class System:
     def __init__(self):
@@ -9,7 +13,12 @@ class System:
         self._iota = 0
         self._trace = False
         self._tracefile = StringIO()
+        self._refs: list[Logic] = []
+        self._clk: Port | None = None
     
+    def add_ref(self, ref: Logic):
+        self._refs.append(ref)
+
     def enable_trace(self):
         self._trace = True
     
@@ -45,6 +54,27 @@ class System:
                 self.tprint(f"END COMMIT {prev} => {state_comp._val}")
             else:
                 raise Exception("invalid state-less component added")
+
+    def all_ports(self) -> Iterator[Port]:
+        return cast(Iterator[Port], filter(lambda c: isinstance(c, Port), self._refs))
+
+    @singledispatchmethod
+    def find_ports(self, pattern) -> Iterator[Port]:
+        raise ValueError(f"invalid pattern type: {type(pattern)}")
+
+    @find_ports.register
+    def _find_ports_str(self, pattern: str) -> Iterator[Port]:
+        return filter(lambda p: p.has_name() and p.get_name().endswith(":" + pattern), 
+                      self.all_ports())
+
+    @find_ports.register
+    def _find_ports_re(self, pattern: Pattern) -> Iterator[Port]:
+        return filter(lambda p: p.has_name() and pattern.fullmatch(p.get_name()) is not None, 
+                      self.all_ports())
+
+    def set_global_clk(self, clk: Logic):
+        for clk_port in self.find_ports("clk"):
+            clk_port.set_driver(clk)
     
     def get_cached(self, i: int) -> Bits | None:
         return self._values.get(i, None)
@@ -95,19 +125,19 @@ class System:
         system_id = self._new()
         _kwargs: dict[str, Any] = {"system": self, "system_id": system_id}
         _kwargs.update(kwargs)
-        return Not(inp, **kwargs)
+        return Not(inp, **_kwargs)
     
     def vector(self, *inp: Logic, **kwargs) -> Vector:
         system_id = self._new()
         _kwargs: dict[str, Any] = {"system": self, "system_id": system_id}
         _kwargs.update(kwargs)
-        return Vector(*inp, **kwargs)
+        return Vector(*inp, **_kwargs)
 
     def mux(self, selector: Logic, *inp: Logic, **kwargs) -> Mux:
         system_id = self._new()
         _kwargs: dict[str, Any] = {"system": self, "system_id": system_id}
         _kwargs.update(kwargs)
-        return Mux(selector, *inp, **kwargs)
+        return Mux(selector, *inp, **_kwargs)
 
 
 class Event:
@@ -221,6 +251,9 @@ class Logic:
         self._signal: Signal | None = None
         self._system = system
         self._system_id = system_id
+        
+        if self._system is not None:
+            self._system.add_ref(self)
     
     def _register_fw(self, fw: "Logic"):
         self._fw_con.append(fw)
@@ -259,6 +292,10 @@ class Logic:
 
     def has_name(self) -> bool:
         return self._name is not None
+
+    def is_clk(self) -> bool:
+        return isinstance(self, Port) and self.has_name() and (
+                self.get_name().endswith(":clk") or self.get_name() == "clk")
     
     def register_signal(self, signal: Signal) -> "Logic":
         assert self._name is not None, \
@@ -284,7 +321,27 @@ class Logic:
         else:
             dff = DFlipFlop(self, clk, **kwargs)
         return dff
+
+    def dflipflop_vector(self, clk: "Logic", inherit_name: bool = False, **kwargs) -> Vector:
+        assert self.width() > 1, \
+                "You cannot add a vectored dflipflop to a logic-component with width 1"
+        dffs = [c.dflipflop(clk) for c in self.unwrap()]
+
+        if inherit_name:
+            assert "name" not in kwargs, \
+                "cannot inherit name if an explicit name is requested"
+            kwargs["name"] = self.get_name()
+            self.unset_name()
+
+        if self._system is not None:
+            dff_vec = self._system.vector(*dffs, **kwargs)
+        else:
+            assert False
+            dff_vec = Vector(*dffs, **kwargs)
+
+        return dff_vec
     
+        
     def shr(self, clk: "Logic", inherit_name: bool = False, signal_dffs: Signal | None = None, **kwargs) -> "Logic":
         if inherit_name:
             assert "name" not in kwargs, \
@@ -343,7 +400,7 @@ class Logic:
     def _eval_impl(self) -> Bits:
         raise RuntimeError(f"eval not implemented for {self.__class__}")
     
-    def unwrap(self) -> list["Wire"]:
+    def unwrap(self) -> list["Logic"]:
         if self._system is not None:
             return [self._system.wire(self, i) for i in range(self.width())]
         return [Wire(self, i) for i in range(self.width())]
@@ -411,7 +468,7 @@ class Bits(Logic):
 
         return bits
     
-    def unwrap(self) -> list["Bits"]:
+    def unwrap(self) -> list["Logic"]:
         assert self.is_valid, \
             "can't unwrap unitialized bits"
         return [Bits(1, [b]) for b in self.as_bitarray()]
@@ -548,7 +605,7 @@ class Port(Logic):
         self._width = width
         self._driver: Logic | None = None
     
-    def graph_bw(self, graph: Digraph, fr: Logic | None):
+    def graph_bw(self, graph: Digraph, fr: Logic | None = None):
         if self._driver is not None:
             self._driver.graph_bw(graph, fr)
         elif fr is not None:
@@ -667,20 +724,15 @@ class Comb(Logic):
     def __repr__(self) -> str:
         return f"Comb({repr(self._var)}, {', '.join(map(repr, self._inputs))}{self._name_repr()})"
 
-_WARNING_ONCE = True
 
 class DFlipFlop(Logic):
     def __init__(self, input: Logic, clk: Logic, **kwargs):
-        global _WARNING_ONCE
         super().__init__(**kwargs)
         assert clk.width() == 1
         self._clk = clk
         self._input = input
         self._low = True
-        if _WARNING_ONCE:
-            import sys
-            print("WARNING: initializing FlipFlops with default values", file=sys.stderr)
-            _WARNING_ONCE = False
+        warn_once("initializing FlipFlops with default values")
         self._val = Bits(self._input.width(), [False for _ in range(self._input.width())])
 
         Logic._register_con(input, self)
@@ -786,8 +838,8 @@ class Component:
     def get_outputs(self) -> list[Logic] :
         return self._outputs
     
-    def get_inputs(self) -> list[Logic]:
-        return self._inputs
+    def get_inputs(self, skip_clk: bool = True) -> list[Logic]:
+        return list(i for i in self._inputs if not skip_clk or not i.is_clk())
 
     def eval_all(self) -> list[Bits]:
         return [out.eval() for out in self._outputs]
