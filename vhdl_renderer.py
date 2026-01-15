@@ -1,5 +1,4 @@
 from typing import NoReturn, Iterable
-from functools import cmp_to_key
 from quick_hw import *
 from dataclasses import dataclass
 from math import log2, ceil
@@ -15,7 +14,7 @@ def topo_sort(deps: dict[str, set[str]]) -> list[str]:
     # In-degree count
     indeg = {n: 0 for n in nodes}
     for n, ds in deps.items():
-        for d in ds:
+        for _ in ds:
             indeg[n] += 1
 
     # Start with nodes that have no dependencies
@@ -177,6 +176,8 @@ class VHDLRenderer:
                     assert name not in self._signals
 
                     self._work_stack.append(Input("clk", 1))
+                    self._work_stack.append(Input("ce", 1))
+                    # self._work_stack.append(Input("resetclk", 1))
                     self._clk_assignments[name] = self._render_expr(expr)
                     self._signals[name] = expr.width()
                     self._depends[name] = self._get_dependencies(expr)
@@ -202,7 +203,6 @@ class VHDLRenderer:
                     continue
                 case _:
                     todo(f"{top}")
-            unreachable("every branch should explicitly return") 
     
     def _render_imports(self):
         self._print("library ieee;")
@@ -242,27 +242,33 @@ class VHDLRenderer:
     
     def _render_architecture_body(self):
 
+        # NOTE: might not be necessary
         ordered_assignments = topo_sort(self._depends)
 
-        is_process  = False
+        # Dataflow assignments
         for target in ordered_assignments:
-            is_clked = target in self._clk_assignments
-            if is_clked and not is_process:
-                self._print("\tprocess(clk)")
-                self._print("\tbegin")
-                self._print("\t\t if rising_edge(clk) then")
-                is_process = True
-            elif not is_clked and is_process:
-                self._print("\t\t end if;")
-                self._print("\tend process;")
-                is_process = False
-            
-            if is_clked:
-                self._print(f"\t\t\t{target} <= {self._clk_assignments[target]};") 
-            else:
+            if target in self._assignments:
                 self._print(f"\t{target} <= {self._assignments[target]};") 
 
-
+        # Rising-edge (D-flip-flop)
+        self._print("\tprocess(clk)")
+        self._print("\tbegin")
+        # self._print("\t\t if resetclk /= '1' then")
+        # for target in ordered_assignments:
+        #     if target in self._clk_assignments:
+        #         if self._signals[target] == 1:
+        #             self._print(f"\t\t\t{target} <= '0';")
+        #         else:
+        #             self._print(f"\t\t\t{target} <= (others => '0');") 
+        # self._print("\t\t elsif rising_edge(clk) then")
+        self._print("\t\tif rising_edge(clk) then")
+        self._print("\t\t\tif ce = '1' then")
+        for target in ordered_assignments:
+            if target in self._clk_assignments:
+                self._print(f"\t\t\t\t{target} <= {self._clk_assignments[target]};") 
+        self._print("\t\t\tend if;")
+        self._print("\t\t end if;")
+        self._print("\tend process;")
 
     def _render_script_notion(self):
         import datetime
@@ -366,3 +372,4 @@ class VHDLRenderer:
 
         self._dependency_cache[expr_name] = deps
         return deps
+
